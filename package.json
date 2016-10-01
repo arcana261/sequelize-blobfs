@@ -29,5 +29,9 @@
     "eslint-config-google": "^0.6.0",
     "jsdoc": "^3.4.1",
     "mocha": "^3.1.0"
+  },
+  "dependencies": {
+    "sequelize-db-meta": "arcana261/sequelize-db-meta",
+    "xcane": "arcana261/xcane"
   }
 }
