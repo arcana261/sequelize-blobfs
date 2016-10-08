@@ -4,6 +4,11 @@ const sequelizeMetaDb = require('sequelize-db-meta');
 const task = require('xcane').task;
 const type = require('xcane').type;
 
+const _Type = Object.freeze({
+  DIRECTORY: 'directory',
+  FILE: 'file'
+});
+
 class SequelizeBlobFsCursor {
   constructor(nodeDb, blobDb, id) {
     this._nodeDb = nodeDb;
@@ -32,21 +37,6 @@ class SequelizeBlobFsCursor {
     return Promise.resolve();
   }
 
-  _setPosition(pos) {
-    this._ensure().then(() => {
-      if (pos > this._size) {
-        return Promise.reject(new Error(
-          `New position ${pos} exceeds size ${this._size}`));
-      }
-
-      this._block = Math.floor(pos / this._blockSize);
-      this._index = pos % this._blockSize;
-      this._pos = pos;
-
-      return Promise.resolve();
-    });
-  }
-
   _unloadBlob() {
     const self = this;
 
@@ -61,7 +51,6 @@ class SequelizeBlobFsCursor {
 
       self._dirtyBlob = false;
       self._blob = null;
-      self._index = 0;
     });
   }
 
@@ -72,7 +61,7 @@ class SequelizeBlobFsCursor {
       yield self._ensure();
 
       if (type.isNull(self._blob)) {
-        const totalBlocks = Math.floor(self._size / self._blockSize);
+        const totalBlocks = Math.ceil(self._size / self._blockSize);
         return this._block < totalBlocks;
       }
 
@@ -88,21 +77,37 @@ class SequelizeBlobFsCursor {
 
       if (type.isNull(self._blob)) {
         if (yield self._hasBlob()) {
-          const result = (yield self._blobDb.get(`${self._block}`)).data;
-          self._index = 0;
-          self._blob = result;
+          self._blob = (yield self._blobDb.get(`${self._block}`)).data;
           self._dirtyBlob = false;
-          return result;
+        } else {
+          self._blob = new Buffer(self._blockSize);
+          self._dirtyBlob = true;
         }
-
-        const result = new Buffer(self._blockSize);
-        self._index = 0;
-        self._blob = result;
-        self._dirtyBlob = true;
-        return result;
       }
 
       return self._blob;
+    });
+  }
+
+  _setPosition(pos) {
+    const self = this;
+
+    return task.spawn(function * task() {
+      yield self._ensure();
+
+      if (pos > self._size) {
+        throw new Error(`New position ${pos} exceeds size ${self._size}`);
+      }
+
+      const newBlock = Math.floor(pos / self._blockSize);
+
+      if (newBlock !== self._block) {
+        yield self._unloadBlob();
+      }
+
+      self._block = newBlock;
+      self._index = pos % self._blockSize;
+      self._pos = pos;
     });
   }
 
@@ -118,12 +123,12 @@ class SequelizeBlobFsCursor {
       }
 
       const blob = yield self._loadBlob();
-      const result = blob[self._index];
-      self._index++;
+      const result = blob[self._index++];
       self._pos++;
 
       if (self._index >= self._blockSize) {
         yield self._unloadBlob();
+        self._index = 0;
         self._block++;
       }
 
@@ -143,13 +148,13 @@ class SequelizeBlobFsCursor {
         self._dirtyHeader = true;
       }
 
-      blob[self._index] = value;
+      blob[self._index++] = value;
       self._dirtyBlob = true;
-      self._index++;
       self._pos++;
 
       if (self._index >= self._blockSize) {
         yield self._unloadBlob();
+        self._index = 0;
         self._block++;
       }
     });
@@ -161,6 +166,14 @@ class SequelizeBlobFsCursor {
     return task.spawn(function * task() {
       if (!type.isOptional(position)) {
         yield self._setPosition(position);
+      }
+
+      if (type.isOptional(offset)) {
+        offset = 0;
+      }
+
+      if (type.isOptional(length)) {
+        length = buffer.length - offset;
       }
 
       for (let i = 0; i < length; i++) {
@@ -177,6 +190,14 @@ class SequelizeBlobFsCursor {
         yield self._setPosition(position);
       }
 
+      if (type.isOptional(offset)) {
+        offset = 0;
+      }
+
+      if (type.isOptional(length)) {
+        length = buffer.length - offset;
+      }
+
       for (let i = 0; i < length; i++) {
         yield self._writeByte(buffer[offset + i]);
       }
@@ -190,16 +211,18 @@ class SequelizeBlobFsCursor {
       yield self._ensure();
       return self._size;
     });
-
+  }
 
   close() {
     const self = this;
 
     return task.spawn(function * task() {
-      self._unloadBlob();
+      yield self._unloadBlob();
 
       if (self._dirtyHeader) {
-
+        yield self._nodeDb.assign(`${this._id}`, {
+          size: self._size
+        });
       }
     });
   }
@@ -212,49 +235,22 @@ class SequelizeBlobFs {
         data: {
           type: sequelize.Sequelize.BLOB
         }
-      }));
+      }, definitions), options);
     this._configDb = this._db.prefix('config:');
     this._nodeDb = this._db.prefix('node:');
-    this._blobDb = this._db.prefix('blob:');
+    this._masterBlobDb = this._db.prefix('blob:');
     this._blockSize = blockSize || 4096;
   }
 
-  _targetDb(id) {
-    return this._blobDb.prefix(`${id}:`);
+  _blobDb(id) {
+    return this._masterBlobDb.prefix(`${id}:`);
   }
 
-  _rawRead(id, blockSize, start, length, transaction) {
-    const targetDb = this._targetDb(id);
+  _createEmptyDirectory(id, parent) {
+    const self = this;
 
     return task.spawn(function * task() {
-      let block = Math.floor(start / blockSize);
-      let offset = start % blockSize;
-      let result = [Buffer.alloc(0)];
-
-      while (length > 0) {
-        const record = yield targetDb.getOrNull(`${block}`, transaction);
-
-        if (type.isOptional(record)) {
-          return Buffer.concat(result);
-        }
-
-        let toRead = Math.min(record.data.length - offset, length);
-        result.push(record.data.slice(offset, offset + toRead));
-        length -= toRead;
-        offset = 0;
-        block++;
-      }
-
-      return Buffer.concat(result);
-    });
-  }
-
-  _rawWrite(id, blockSize, start, length, data, transaction) {
-    const targetDb = this._targetDb(id);
-
-    return task.spawn(function * task() {
-      let block = Math.floor(start / blockSize);
-      let offset = start % blockSize;
+      
     });
   }
 }
